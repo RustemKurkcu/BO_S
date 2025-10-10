@@ -1,0 +1,22 @@
+dt = Open( "C:/Users/NelsonLab/Desktop/PPT_and_writeup/Grad_seminar_3-2-2018/TS19.ALL.QC.3tSNE.IBS.HSL.jmp");
+obj = Scatterplot 3D(
+
+       Y(
+
+              :tSNE1,
+
+              :tSNE2,
+
+              :tSNE3
+
+       )
+
+);
+
+obj << Frame3D(
+
+       Set Rotation( 360, -3, 360 ),
+
+       Set Oscillation( -360, 180, 300, 2000 )
+
+);
