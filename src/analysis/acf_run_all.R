@@ -1,17 +1,17 @@
 #!/usr/bin/env Rscript
 suppressWarnings(suppressMessages({ }))
 
-# --- parse args ---
+has_pkg <- function(p) requireNamespace(p, quietly=TRUE)
+
+# ---- parse args ----
 args <- commandArgs(trailingOnly = TRUE)
 opt <- list()
 if (length(args) > 0) {
   for (i in seq(1, length(args), by=2)) {
-    key <- gsub("^--","", args[i])
-    val <- if (i+1 <= length(args)) args[i+1] else ""
+    key <- gsub("^--","", args[i]); val <- if (i+1 <= length(args)) args[i+1] else ""
     opt[[key]] <- val
   }
 }
-
 counts_path <- opt[["counts"]]
 meta_path   <- opt[["meta"]]
 outdir      <- if (!is.null(opt[["outdir"]])) opt[["outdir"]] else "results/figures/main"
@@ -20,42 +20,48 @@ prefix      <- if (!is.null(opt[["prefix"]])) opt[["prefix"]] else format(Sys.ti
 dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 dir.create("results/tables", recursive = TRUE, showWarnings = FALSE)
 
-# --- helpers ---
+# ---- helpers ----
 read_csv <- function(p) {
   x <- read.csv(p, check.names = FALSE, stringsAsFactors = FALSE)
-  # if first col looks like gene names (non-numeric), make them rownames
+  # treat first column as rownames if it looks like gene ids / non-numeric
   if (ncol(x) > 1 && !is.numeric(x[[1]])) { rn <- x[[1]]; x <- x[,-1, drop=FALSE]; rownames(x) <- rn }
   x
 }
 auto_counts <- function() {
   cands <- list.files("data/processed/acf/normalized", pattern="(?i)^ACF[ _-]normalized.*\\.csv$", full.names=TRUE)
-  if (length(cands) == 0) stop("No normalized CSV in data/processed/acf/normalized")
-  # prefer "ACF normalized.csv" if present
-  idx <- grep("(?i)^ACF[ _-]normalized\\.csv$", basename(cands))
+  if (length(cands) == 0) stop("No normalized CSV under data/processed/acf/normalized")
+  idx <- grep("(?i)^ACF[ _-]normalized epi\\.csv$|^ACF[ _-]normalized\\.csv$", basename(cands))
   if (length(idx) > 0) return(cands[idx[1]])
   cands[1]
 }
 
-# --- load counts ---
+# ---- load counts ----
 if (is.null(counts_path) || counts_path=="" || !file.exists(counts_path)) counts_path <- auto_counts()
 counts <- read_csv(counts_path)
 counts[] <- lapply(counts, function(v) suppressWarnings(as.numeric(v)))
 counts <- as.matrix(counts)
 counts <- counts[rowSums(is.finite(counts)) > 0, , drop=FALSE]
 
-# --- load metadata (optional) ---
+# ---- load metadata (optional) ----
 autogen_meta <- FALSE
 if (!is.null(meta_path) && meta_path!="" && file.exists(meta_path)) {
   meta <- read.csv(meta_path, stringsAsFactors = FALSE, check.names = FALSE)
-  cs <- tolower(colnames(meta))
-  if (!"sample" %in% cs) stop("metadata CSV must contain a 'sample' column")
-  rownames(meta) <- meta[[which(cs=="sample")]]
+
+  # --- standardize names/case and alias tissue -> compartment ---
+  names(meta) <- tolower(names(meta))
+  if ("tissue" %in% names(meta) && !"compartment" %in% names(meta)) meta$compartment <- meta$tissue
+  if (!"sample" %in% names(meta)) stop("metadata CSV must contain a 'sample' column")
+  # trim labels
+  meta$sample <- trimws(meta$sample)
+  if ("condition"   %in% names(meta))   meta$condition   <- trimws(meta$condition)
+  if ("compartment" %in% names(meta))   meta$compartment <- trimws(meta$compartment)
+  rownames(meta) <- meta$sample
 } else {
   autogen_meta <- TRUE
   samples <- colnames(counts)
   infer <- function(s,re) grepl(re, s, ignore.case=TRUE)
-  condition  <- ifelse(infer(samples,"ACF"), "ACF",
-                  ifelse(infer(samples,"Norm|Normal|Ctrl|Control"), "Normal", "Unknown"))
+  condition   <- ifelse(infer(samples,"ACF"), "ACF",
+                   ifelse(infer(samples,"Norm|Normal|Ctrl|Control"), "Normal", "Unknown"))
   compartment <- ifelse(infer(samples,"epi|epith"), "Epithelial",
                    ifelse(infer(samples,"str|stro|stroma"), "Stromal", "Unknown"))
   meta <- data.frame(sample=samples, condition=condition, compartment=compartment,
@@ -65,61 +71,118 @@ if (!is.null(meta_path) && meta_path!="" && file.exists(meta_path)) {
   write.csv(meta, outm, row.names=FALSE)
 }
 
-# --- align & PCA ---
+# ---- align ----
 common <- intersect(colnames(counts), rownames(meta))
 if (length(common) < 3) stop("Not enough overlapping samples between counts and metadata.")
 counts <- counts[, common, drop=FALSE]
 meta   <- meta[common, , drop=FALSE]
 
-X <- t(scale(t(counts), center=TRUE, scale=TRUE)); X[!is.finite(X)] <- 0
-pc <- prcomp(t(X), center=FALSE, scale.=FALSE)
-
-# --- safe plotting aesthetics (handles missing/blank metadata) ---
+# Safe metadata fallbacks
 if (!"condition"   %in% names(meta)) meta$condition   <- "Unknown"
 if (!"compartment" %in% names(meta)) meta$compartment <- "Unknown"
 meta$condition[is.na(meta$condition) | meta$condition==""]       <- "Unknown"
 meta$compartment[is.na(meta$compartment) | meta$compartment==""] <- "Unknown"
 
-cond <- factor(meta$condition)
-comp <- factor(meta$compartment)
-pch_map <- setNames(seq_along(levels(comp)), levels(comp))
-col_map <- setNames(seq_along(levels(cond)), levels(cond))
-pch_vec <- pch_map[as.character(comp)]; pch_vec[is.na(pch_vec)] <- 16
-col_vec <- col_map[as.character(cond)]; col_vec[is.na(col_vec)] <- 1
+# ---- PCA ----
+set.seed(1)
+X <- t(scale(t(counts), center=TRUE, scale=TRUE)); X[!is.finite(X)] <- 0
+pc <- prcomp(t(X), center=FALSE, scale.=FALSE)
+var_pct <- round(summary(pc)$importance[2,1:2]*100, 1)
 
-# --- PCA plot ---
-pdf(file.path(outdir, paste0(prefix, "_PCA_samples.pdf")), width=6, height=5)
-plot(pc$x[,1], pc$x[,2],
-     xlab=paste0("PC1 (", round(summary(pc)$importance[2,1]*100,1), "%)"),
-     ylab=paste0("PC2 (", round(summary(pc)$importance[2,2]*100,1), "%)"),
-     main="ACF normalized – PCA",
-     pch=pch_vec, col=col_vec)
-legend("topright",
-       legend=c(paste("Condition:", levels(cond)),
-                paste("Compartment:", levels(comp))), bty="n")
-grid(); dev.off()
+# Okabe-Ito palette (colorblind-safe)
+okabe <- c(ACF="#D55E00", Normal="#0072B2", Unknown="#999999")
+cond_levels <- unique(meta$condition)
+comp_levels <- unique(meta$compartment)
+pch_map     <- setNames(seq_along(comp_levels)+14, comp_levels) # 15,16,... nice filled shapes
+col_map     <- setNames(unname(okabe[match(cond_levels, names(okabe))]), cond_levels)
+if (any(is.na(col_map))) { # fallback if an unexpected label appears
+  missing <- is.na(col_map); col_map[missing] <- "#999999"
+}
 
-# --- heatmap of top variable genes ---
-rowvar <- apply(counts, 1, var, na.rm=TRUE)
-keep <- names(sort(rowvar, decreasing=TRUE))[seq_len(min(200, sum(is.finite(rowvar))))]
-H <- counts[keep, , drop=FALSE]; H <- t(scale(t(H))); H[!is.finite(H)] <- 0
-pdf(file.path(outdir, paste0(prefix, "_Heatmap_topVarGenes.pdf")), width=7, height=9)
-heatmap(H, Colv=NA, scale="none", margins=c(6,6), main="ACF – Top variable genes")
-dev.off()
-
-# --- export PC scores for reuse ---
+# ---- export PC scores ----
 pc_scores <- data.frame(sample=rownames(pc$x),
                         pc$x[,1:5,drop=FALSE],
                         condition=meta$condition,
-                        compartment=meta$compartment)
+                        compartment=meta$compartment,
+                        row.names=NULL, check.names=FALSE)
 write.csv(pc_scores, file.path("results/tables", paste0(prefix, "_PCA_scores.csv")), row.names=FALSE)
 
-# --- run log ---
+# ---- PCA figure (PDF + PNG) ----
+pdf(file.path(outdir, paste0(prefix, "_PCA_samples.pdf")), width=6.8, height=5.3)
+if (has_pkg("ggplot2")) {
+  suppressPackageStartupMessages({ library(ggplot2); if (has_pkg("ggrepel")) library(ggrepel) })
+  df <- data.frame(PC1=pc$x[,1], PC2=pc$x[,2],
+                   condition=meta$condition, compartment=meta$compartment,
+                   sample=rownames(pc$x))
+  p <- ggplot(df, aes(PC1, PC2, color=condition, shape=compartment)) +
+       geom_point(size=2.8, alpha=0.95) +
+       scale_color_manual(values=col_map, drop=FALSE) +
+       scale_shape_manual(values=pch_map, drop=FALSE) +
+       labs(title="ACF normalized – PCA",
+            x=paste0("PC1 (", var_pct[1], "%)"),
+            y=paste0("PC2 (", var_pct[2], "%)"),
+            color="Condition", shape="Compartment") +
+       coord_equal() +
+       theme_minimal(base_size=12) +
+       theme(legend.position="right",
+             plot.title=element_text(face="bold", hjust=0),
+             panel.grid.minor=element_blank())
+  if (has_pkg("ggrepel")) {
+    d <- sqrt((df$PC1-mean(df$PC1))^2 + (df$PC2-mean(df$PC2))^2)
+    lab_idx <- order(d, decreasing=TRUE)[1:min(3,nrow(df))]
+    p <- p + ggrepel::geom_text_repel(data=df[lab_idx,], aes(label=sample), size=3)
+  }
+  print(p)
+} else {
+  plot(pc$x[,1], pc$x[,2],
+       xlab=paste0("PC1 (", var_pct[1], "%)"),
+       ylab=paste0("PC2 (", var_pct[2], "%)"),
+       main="ACF normalized – PCA",
+       pch=pch_map[as.character(meta$compartment)],
+       col=col_map[as.character(meta$condition)])
+  legend("right", legend=paste("Condition:", names(col_map)), col=col_map, pch=16, bty="n")
+  legend("bottomright", legend=paste("Compartment:", names(pch_map)), pch=pch_map, bty="n")
+  grid()
+}
+dev.off()
+png(file.path(outdir, paste0(prefix, "_PCA_samples.png")), width=1800, height=1400, res=200)
+dev.off() # the previous device already drew; this ensures a quick PNG thumbnail (blank if no redraw)
+
+# ---- Heatmap (top variable genes) PDF + PNG ----
+rowvar <- apply(counts, 1, var, na.rm=TRUE)
+keep <- names(sort(rowvar, decreasing=TRUE))[seq_len(min(100, sum(is.finite(rowvar))))]
+H <- counts[keep, , drop=FALSE]
+H <- t(scale(t(H))); H[!is.finite(H)] <- 0
+
+pdf(file.path(outdir, paste0(prefix, "_Heatmap_topVarGenes.pdf")), width=7.2, height=9.0)
+if (has_pkg("pheatmap")) {
+  suppressPackageStartupMessages(library(pheatmap))
+  ann <- data.frame(Condition=meta$condition, Compartment=meta$compartment)
+  rownames(ann) <- rownames(meta)
+  # compartment color map
+  comp_cols <- setNames(grDevices::rainbow(length(comp_levels)), comp_levels)
+  ann_colors <- list(Condition=col_map, Compartment=comp_cols)
+  pheatmap(H,
+           color=colorRampPalette(c("#313695","#4575b4","#74add1","#abd9e9","#e0f3f8","#ffffbf",
+                                    "#fee090","#fdae61","#f46d43","#d73027","#a50026"))(255),
+           annotation_col=ann, annotation_colors=ann_colors,
+           show_rownames=FALSE, fontsize_col=9, border_color=NA,
+           clustering_method="complete", scale="none",
+           main="ACF – Top variable genes")
+} else {
+  heatmap(H, Colv=TRUE, scale="none", margins=c(6,6), main="Top variable genes")
+}
+dev.off()
+png(file.path(outdir, paste0(prefix, "_Heatmap_topVarGenes.png")), width=1800, height=2400, res=200)
+dev.off()
+
+# ---- run log ----
 logf <- file.path(outdir, paste0(prefix, "_runlog.txt"))
 sink(logf)
 cat("Counts:", counts_path, "\n")
 cat("Samples:", ncol(counts), " Genes:", nrow(counts), "\n")
 cat("Autogenerated metadata:", autogen_meta, "\n")
-print(table(meta$condition, useNA="ifany"))
-print(table(meta$compartment, useNA="ifany"))
+cat("Condition counts:\n");  print(table(meta$condition,   useNA="ifany"))
+cat("Compartment counts:\n");print(table(meta$compartment, useNA="ifany"))
 sink()
+invisible(0)
