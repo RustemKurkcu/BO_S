@@ -1,36 +1,49 @@
 #!/usr/bin/env Rscript
 suppressWarnings(suppressMessages({ }))
 
-# ---- args ----
+# --- parse args ---
 args <- commandArgs(trailingOnly = TRUE)
 opt <- list()
 if (length(args) > 0) {
   for (i in seq(1, length(args), by=2)) {
-    key <- gsub("^--","", args[i]); val <- if (i+1 <= length(args)) args[i+1] else ""
+    key <- gsub("^--","", args[i])
+    val <- if (i+1 <= length(args)) args[i+1] else ""
     opt[[key]] <- val
   }
 }
+
 counts_path <- opt[["counts"]]
 meta_path   <- opt[["meta"]]
 outdir      <- if (!is.null(opt[["outdir"]])) opt[["outdir"]] else "results/figures/main"
 prefix      <- if (!is.null(opt[["prefix"]])) opt[["prefix"]] else format(Sys.time(), "%Y%m%d_acf")
-dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 
-# ---- IO helpers ----
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+dir.create("results/tables", recursive = TRUE, showWarnings = FALSE)
+
+# --- helpers ---
 read_csv <- function(p) {
   x <- read.csv(p, check.names = FALSE, stringsAsFactors = FALSE)
+  # if first col looks like gene names (non-numeric), make them rownames
   if (ncol(x) > 1 && !is.numeric(x[[1]])) { rn <- x[[1]]; x <- x[,-1, drop=FALSE]; rownames(x) <- rn }
-  return(x)
+  x
+}
+auto_counts <- function() {
+  cands <- list.files("data/processed/acf/normalized", pattern="(?i)^ACF[ _-]normalized.*\\.csv$", full.names=TRUE)
+  if (length(cands) == 0) stop("No normalized CSV in data/processed/acf/normalized")
+  # prefer "ACF normalized.csv" if present
+  idx <- grep("(?i)^ACF[ _-]normalized\\.csv$", basename(cands))
+  if (length(idx) > 0) return(cands[idx[1]])
+  cands[1]
 }
 
-# ---- counts ----
-if (is.null(counts_path) || counts_path=="" || !file.exists(counts_path)) stop("Provide --counts")
+# --- load counts ---
+if (is.null(counts_path) || counts_path=="" || !file.exists(counts_path)) counts_path <- auto_counts()
 counts <- read_csv(counts_path)
 counts[] <- lapply(counts, function(v) suppressWarnings(as.numeric(v)))
 counts <- as.matrix(counts)
 counts <- counts[rowSums(is.finite(counts)) > 0, , drop=FALSE]
 
-# ---- metadata (optional; auto if missing) ----
+# --- load metadata (optional) ---
 autogen_meta <- FALSE
 if (!is.null(meta_path) && meta_path!="" && file.exists(meta_path)) {
   meta <- read.csv(meta_path, stringsAsFactors = FALSE, check.names = FALSE)
@@ -52,7 +65,7 @@ if (!is.null(meta_path) && meta_path!="" && file.exists(meta_path)) {
   write.csv(meta, outm, row.names=FALSE)
 }
 
-# ---- align + PCA ----
+# --- align & PCA ---
 common <- intersect(colnames(counts), rownames(meta))
 if (length(common) < 3) stop("Not enough overlapping samples between counts and metadata.")
 counts <- counts[, common, drop=FALSE]
@@ -61,20 +74,32 @@ meta   <- meta[common, , drop=FALSE]
 X <- t(scale(t(counts), center=TRUE, scale=TRUE)); X[!is.finite(X)] <- 0
 pc <- prcomp(t(X), center=FALSE, scale.=FALSE)
 
-cond <- factor(meta$condition); comp <- factor(meta$compartment)
+# --- safe plotting aesthetics (handles missing/blank metadata) ---
+if (!"condition"   %in% names(meta)) meta$condition   <- "Unknown"
+if (!"compartment" %in% names(meta)) meta$compartment <- "Unknown"
+meta$condition[is.na(meta$condition) | meta$condition==""]       <- "Unknown"
+meta$compartment[is.na(meta$compartment) | meta$compartment==""] <- "Unknown"
+
+cond <- factor(meta$condition)
+comp <- factor(meta$compartment)
 pch_map <- setNames(seq_along(levels(comp)), levels(comp))
 col_map <- setNames(seq_along(levels(cond)), levels(cond))
+pch_vec <- pch_map[as.character(comp)]; pch_vec[is.na(pch_vec)] <- 16
+col_vec <- col_map[as.character(cond)]; col_vec[is.na(col_vec)] <- 1
 
+# --- PCA plot ---
 pdf(file.path(outdir, paste0(prefix, "_PCA_samples.pdf")), width=6, height=5)
 plot(pc$x[,1], pc$x[,2],
      xlab=paste0("PC1 (", round(summary(pc)$importance[2,1]*100,1), "%)"),
      ylab=paste0("PC2 (", round(summary(pc)$importance[2,2]*100,1), "%)"),
      main="ACF normalized – PCA",
-     pch=pch_map[as.character(comp)], col=col_map[as.character(cond)])
-legend("topright", legend=paste(levels(cond), "(color) /", levels(comp), "(shape)"), bty="n")
+     pch=pch_vec, col=col_vec)
+legend("topright",
+       legend=c(paste("Condition:", levels(cond)),
+                paste("Compartment:", levels(comp))), bty="n")
 grid(); dev.off()
 
-# ---- heatmap (top var genes) ----
+# --- heatmap of top variable genes ---
 rowvar <- apply(counts, 1, var, na.rm=TRUE)
 keep <- names(sort(rowvar, decreasing=TRUE))[seq_len(min(200, sum(is.finite(rowvar))))]
 H <- counts[keep, , drop=FALSE]; H <- t(scale(t(H))); H[!is.finite(H)] <- 0
@@ -82,7 +107,14 @@ pdf(file.path(outdir, paste0(prefix, "_Heatmap_topVarGenes.pdf")), width=7, heig
 heatmap(H, Colv=NA, scale="none", margins=c(6,6), main="ACF – Top variable genes")
 dev.off()
 
-# ---- run log ----
+# --- export PC scores for reuse ---
+pc_scores <- data.frame(sample=rownames(pc$x),
+                        pc$x[,1:5,drop=FALSE],
+                        condition=meta$condition,
+                        compartment=meta$compartment)
+write.csv(pc_scores, file.path("results/tables", paste0(prefix, "_PCA_scores.csv")), row.names=FALSE)
+
+# --- run log ---
 logf <- file.path(outdir, paste0(prefix, "_runlog.txt"))
 sink(logf)
 cat("Counts:", counts_path, "\n")
