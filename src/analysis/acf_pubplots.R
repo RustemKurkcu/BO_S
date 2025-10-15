@@ -1,5 +1,6 @@
 suppressWarnings(suppressMessages({library(grDevices)}))
 has <- function(p) requireNamespace(p, quietly=TRUE)
+
 args <- commandArgs(trailingOnly=TRUE); opt <- list()
 if (length(args)>0){for(i in seq(1,length(args),2)){k<-gsub("^--","",args[i]); v<-if(i+1<=length(args)) args[i+1] else ""; opt[[k]]<-v}}
 
@@ -19,66 +20,85 @@ read_csv <- function(p){
   x
 }
 
+# --- load counts ---
 counts <- read_csv(counts_path)
 counts[] <- lapply(counts, function(v) suppressWarnings(as.numeric(v)))
 counts <- as.matrix(counts)
+colnames(counts) <- trimws(colnames(counts))
 
+# --- load metadata and find 'sample' column ---
 meta <- read.csv(meta_path, stringsAsFactors=FALSE, check.names=FALSE)
-if(!"sample"%in%names(meta)) stop("metadata must contain 'sample'")
-if(!"condition"%in%names(meta)) meta$condition <- "Unknown"
-if(!"compartment"%in%names(meta)) meta$compartment <- "Unknown"
+cand <- c("sample","Sample","sample_id","SampleID","id","ID","barcode","name","Name","sample_name")
+hit <- cand[cand %in% names(meta)]
+if (length(hit) >= 1) {
+  meta$sample <- trimws(as.character(meta[[hit[1]]]))
+} else if (!is.null(rownames(meta)) && all(nchar(rownames(meta))>0)) {
+  meta$sample <- trimws(rownames(meta))
+} else {
+  meta$sample <- trimws(colnames(counts))
+}
+if (!"sample" %in% names(meta)) stop("metadata must contain or resolve to a 'sample' column")
+if (!"condition" %in% names(meta)) meta$condition <- "Unknown"
+if (!"compartment" %in% names(meta)) meta$compartment <- "Unknown"
+
+meta$sample <- make.unique(meta$sample)
 rownames(meta) <- meta$sample
 
-# align to metadata
 keep <- intersect(colnames(counts), rownames(meta))
 counts <- counts[, keep, drop=FALSE]
 meta   <- meta[keep, , drop=FALSE]
 
 # optional compartment filter
-if(nchar(comp_filt)>0){
+if (nchar(comp_filt)>0){
   meta   <- subset(meta, compartment==comp_filt)
   keep   <- intersect(colnames(counts), rownames(meta))
   counts <- counts[, keep, drop=FALSE]
   meta   <- meta[keep, , drop=FALSE]
 }
 
-# guard: need >=3 samples
-if(ncol(counts) < 3){ stop("Fewer than 3 samples after filtering.") }
-
-# drop zero-SD genes BEFORE scaling/PCA
+# guards
+if (ncol(counts) < 3) stop("Fewer than 3 samples after filtering.")
 g_sd <- apply(counts, 1, sd, na.rm=TRUE)
 counts <- counts[g_sd > 0 & is.finite(g_sd), , drop=FALSE]
+if (nrow(counts) < 2) stop("Fewer than 2 variable genes after filtering.")
 
-# PCA matrix: per-gene z-score; replace non-finite with 0
-X <- t(scale(t(counts), center=TRUE, scale=TRUE))
-X[!is.finite(X)] <- 0
-
+# PCA matrix
+X <- t(scale(t(counts), center=TRUE, scale=TRUE)); X[!is.finite(X)] <- 0
 pc <- prcomp(t(X), center=FALSE, scale.=FALSE)
 varp <- round(summary(pc)$importance[2,1:2]*100,1)
 
-# Okabe-Ito colors for condition
+# Okabe–Ito colors
 cond_levels <- unique(meta$condition)
 okabe <- c("#D55E00","#0072B2","#009E73","#E69F00","#56B4E9","#CC79A7","#000000","#F0E442")
 cond_map <- setNames(rep(okabe, length.out=length(cond_levels)), cond_levels)
 
+# PCA plot
 pdf(file.path(outdir, paste0(prefix, if(nchar(comp_filt)>0) paste0("_",comp_filt), "_PCA_samples.pdf")), width=6.6, height=5.2)
 if (has("ggplot2")) {
   suppressPackageStartupMessages({library(ggplot2); if(has("ggrepel")) library(ggrepel)})
   df <- data.frame(PC1=pc$x[,1], PC2=pc$x[,2], condition=meta$condition, compartment=meta$compartment, sample=rownames(pc$x))
-  p <- ggplot(df, aes(PC1,PC2,color=condition,shape=compartment))+
-       geom_point(size=2.6, alpha=0.95)+
-       scale_color_manual(values=cond_map, drop=FALSE)+
-       labs(title="ACF normalized – PCA", x=paste0("PC1 (",varp[1],"%)"), y=paste0("PC2 (",varp[2],"%)"), color="Condition", shape="Compartment")+
-       theme_minimal(base_size=11)+theme(plot.title=element_text(face="bold"))
-  if(has("ggrepel")){d<-sqrt((df$PC1-mean(df$PC1))^2+(df$PC2-mean(df$PC2))^2); lab<-order(d,decreasing=TRUE)[1:min(3,nrow(df))]; p<-p+ggrepel::geom_text_repel(data=df[lab,], aes(label=sample), size=3)}
+  p <- ggplot(df, aes(PC1,PC2,color=condition,shape=compartment)) +
+       geom_point(size=2.6, alpha=0.95) +
+       scale_color_manual(values=cond_map, drop=FALSE) +
+       labs(title="ACF normalized – PCA",
+            x=paste0("PC1 (",varp[1],"%)"), y=paste0("PC2 (",varp[2],"%)"),
+            color="Condition", shape="Compartment") +
+       theme_minimal(base_size=11) + theme(plot.title=element_text(face="bold"))
+  if(has("ggrepel")){
+    d <- sqrt((df$PC1-mean(df$PC1))^2 + (df$PC2-mean(df$PC2))^2)
+    lab <- order(d, decreasing=TRUE)[1:min(3, nrow(df))]
+    p <- p + ggrepel::geom_text_repel(data=df[lab,], aes(label=sample), size=3)
+  }
   print(p)
 } else {
-  plot(pc$x[,1], pc$x[,2], col=cond_map[as.character(meta$condition)], pch=as.numeric(as.factor(meta$compartment))+14,
-       xlab=paste0("PC1 (",varp[1],"%)"), ylab=paste0("PC2 (",varp[2],"%)"), main="ACF normalized – PCA"); grid()
+  plot(pc$x[,1], pc$x[,2], col=cond_map[as.character(meta$condition)],
+       pch=as.numeric(as.factor(meta$compartment))+14,
+       xlab=paste0("PC1 (",varp[1],"%)"), ylab=paste0("PC2 (",varp[2],"%)"),
+       main="ACF normalized – PCA"); grid()
 }
 dev.off()
 
-# Heatmap: top variable genes
+# Heatmap: top-N variable genes
 rowvar <- apply(counts,1,var,na.rm=TRUE)
 topN   <- min(topN, sum(is.finite(rowvar)))
 if (topN >= 2) {
@@ -86,7 +106,7 @@ if (topN >= 2) {
   H <- counts[keepg,,drop=FALSE]
   H <- t(scale(t(H))); H[!is.finite(H)] <- 0
   pdf(file.path(outdir, paste0(prefix, if(nchar(comp_filt)>0) paste0("_",comp_filt), "_Heatmap_topVarGenes.pdf")), width=7.5, height=9)
-  if(has("pheatmap") && nrow(H)>1 && ncol(H)>1){
+  if (has("pheatmap") && nrow(H)>1 && ncol(H)>1) {
     suppressPackageStartupMessages(library(pheatmap))
     ann <- data.frame(Condition=meta$condition, Compartment=meta$compartment); rownames(ann) <- rownames(meta)
     vir <- colorRampPalette(hcl.colors(255, "Viridis"))(255)
@@ -94,14 +114,18 @@ if (topN >= 2) {
              annotation_col=ann, clustering_method="complete", border_color=NA,
              main=paste0("Top ", nrow(H), " variable genes (scaled)", if(nchar(comp_filt)>0) paste0(" – ",comp_filt)))
   } else {
-    heatmap(H, Colv=TRUE, scale="none", margins=c(7,7), main=paste("Top", nrow(H), "variable genes"))
+    heatmap(H, Colv=TRUE, scale="none", margins=c(7,7),
+            main=paste("Top", nrow(H), "variable genes"))
   }
   dev.off()
 }
 
 # Save PC scores + runlog
-pc_scores <- data.frame(sample=rownames(pc$x), pc$x[,1:5,drop=FALSE], condition=meta$condition, compartment=meta$compartment)
-write.csv(pc_scores, file.path("results/tables", paste0(prefix, if(nchar(comp_filt)>0) paste0("_",comp_filt), "_PCA_scores.csv")), row.names=FALSE)
+pc_scores <- data.frame(sample=rownames(pc$x), pc$x[,1:5,drop=FALSE],
+                        condition=meta$condition, compartment=meta$compartment)
+write.csv(pc_scores, file.path("results/tables",
+          paste0(prefix, if(nchar(comp_filt)>0) paste0("_",comp_filt), "_PCA_scores.csv")),
+          row.names=FALSE)
 
 sink(file.path(outdir, paste0(prefix, if(nchar(comp_filt)>0) paste0("_",comp_filt), "_runlog.txt")))
 cat("Counts:", counts_path, "\n")
@@ -109,4 +133,5 @@ cat("Samples:", ncol(counts), " Genes:", nrow(counts), "\n")
 cat("Autogenerated metadata: FALSE\n")
 print(table(meta$condition, useNA="ifany"))
 print(table(meta$compartment, useNA="ifany"))
+if (has("utils")) utils::sessionInfo()
 sink()
